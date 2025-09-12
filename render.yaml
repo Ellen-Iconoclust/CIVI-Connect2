@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: civic-connect-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+databases:
+  - name: civic-connect-db
+hooks:
+  build:
+    - python init_db.py
