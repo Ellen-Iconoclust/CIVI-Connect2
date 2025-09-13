@@ -18,20 +18,16 @@ from sqlalchemy import func
 app = Flask(__name__)
 CORS(app)
 
-# SECRET_KEY: use environment variable in Render (recommended) or fallback for local dev
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev_secret_key')
 
-# Database URL: prefer env DATABASE_URL (Postgres on Render). If absent, use local SQLite.
 database_url = os.environ.get('DATABASE_URL')
 if database_url and database_url.startswith('postgres://'):
-    # Update old-style URL if necessary
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
 if not database_url:
     database_url = 'sqlite:///civi_connect.db'
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Uploads folder
 UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER', 'uploads')
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -47,7 +43,7 @@ class User(db.Model):
     name = db.Column(db.String(100), nullable=False, default='User')
     email = db.Column(db.String(100), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
-    role = db.Column(db.String(20), default='citizen')  # 'citizen' or 'admin'
+    role = db.Column(db.String(20), default='citizen')
     department = db.Column(db.String(50))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     is_active = db.Column(db.Boolean, default=True)
@@ -58,7 +54,7 @@ class Issue(db.Model):
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text)
     issue_type = db.Column(db.String(50), nullable=False)
-    status = db.Column(db.String(20), default='reported')  # reported, acknowledged, in_progress, resolved
+    status = db.Column(db.String(20), default='reported')
     priority = db.Column(db.String(10), default='medium')
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
@@ -128,10 +124,8 @@ def token_response_for_user(user):
         'user_id': user.id,
         'email': user.email,
         'role': user.role,
-        # optionally: 'exp': datetime.utcnow() + timedelta(days=7)
     }
     token = jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
-    # PyJWT >=2 returns str, older returns bytes
     if isinstance(token, bytes):
         token = token.decode('utf-8')
     return token
@@ -177,7 +171,6 @@ def login():
 @app.route('/api/admin-login', methods=['POST'])
 def admin_login():
     data = request.get_json() or {}
-    # Simple admin login mechanism (for initial admin provisioning)
     if data.get('admin_id') == 'admin123' and data.get('code') == 'secure2024':
         admin_user = User.query.filter_by(email='admin@city.gov').first()
         if not admin_user:
@@ -195,20 +188,18 @@ def admin_login():
 # Routes: Issues
 # -------------------------
 @app.route('/api/issues', methods=['GET'])
-@token_required
-def get_issues(current_user):
-    # Query parameters: user_id, status, search
+def get_issues_public():
+    """ Public: anyone can view issues """
+    query = Issue.query
     user_id = request.args.get('user_id')
     status = request.args.get('status')
     search = request.args.get('search')
 
-    query = Issue.query
     if user_id:
         query = query.filter_by(reported_by=int(user_id))
     if status:
         query = query.filter_by(status=status)
     if search:
-        # simple contains
         query = query.filter((Issue.title.contains(search)) | (Issue.description.contains(search)))
 
     issues = query.order_by(Issue.created_at.desc()).all()
@@ -234,7 +225,7 @@ def get_issues(current_user):
 @app.route('/api/issues', methods=['POST'])
 @token_required
 def create_issue(current_user):
-    # Accept JSON or multipart/form-data (for image)
+    # same as before (kept secure for logged-in users)
     if request.content_type and 'multipart/form-data' in request.content_type:
         title = request.form.get('title')
         description = request.form.get('description')
@@ -254,7 +245,6 @@ def create_issue(current_user):
     if not title or not issue_type or latitude is None or longitude is None:
         return jsonify({'error': 'Missing required fields (title, issue_type, latitude, longitude)'}), 400
 
-    # handle image
     image_url = None
     if 'image' in request.files:
         file = request.files['image']
@@ -294,7 +284,6 @@ def update_issue(current_user, issue_id):
     issue = Issue.query.get_or_404(issue_id)
     data = request.get_json() or {}
 
-    # Only admin or reporter can update
     if current_user.role != 'admin' and issue.reported_by != current_user.id:
         return jsonify({'error': 'Unauthorized'}), 403
 
@@ -324,7 +313,6 @@ def delete_issue(current_user, issue_id):
     if current_user.role != 'admin':
         return jsonify({'error': 'Unauthorized'}), 403
 
-    # delete image file if exists
     if issue.image_url and issue.image_url.startswith('/uploads/'):
         filename = issue.image_url.split('/')[-1]
         try:
@@ -338,13 +326,10 @@ def delete_issue(current_user, issue_id):
     return jsonify({'message': 'Issue deleted'})
 
 # -------------------------
-# Admin stats
+# Admin stats (now PUBLIC)
 # -------------------------
 @app.route('/api/admin/stats', methods=['GET'])
-@token_required
-def get_admin_stats(current_user):
-    # Removed admin-only restriction here
-
+def get_admin_stats_public():
     total_issues = Issue.query.count()
     pending_issues = Issue.query.filter(Issue.status.in_(['reported', 'acknowledged'])).count()
     in_progress_issues = Issue.query.filter_by(status='in_progress').count()
@@ -369,8 +354,7 @@ def get_admin_stats(current_user):
 # Issue updates / uploads
 # -------------------------
 @app.route('/api/issues/<int:issue_id>/updates', methods=['GET'])
-@token_required
-def get_issue_updates(current_user, issue_id):
+def get_issue_updates_public(issue_id):
     updates = IssueUpdate.query.filter_by(issue_id=issue_id).order_by(IssueUpdate.created_at.desc()).all()
     updates_data = []
     for u in updates:
