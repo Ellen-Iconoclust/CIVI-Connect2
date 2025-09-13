@@ -343,8 +343,7 @@ def delete_issue(current_user, issue_id):
 @app.route('/api/admin/stats', methods=['GET'])
 @token_required
 def get_admin_stats(current_user):
-    if current_user.role != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 403
+    # Removed admin-only restriction here
 
     total_issues = Issue.query.count()
     pending_issues = Issue.query.filter(Issue.status.in_(['reported', 'acknowledged'])).count()
