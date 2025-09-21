@@ -1,16 +1,18 @@
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import wraps
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
 import requests
 import jwt
-from sqlalchemy import func
+
+# Whisper
+import whisper
+import tempfile
 
 # -------------------------
 # App + config
@@ -99,8 +101,6 @@ def token_required(f):
             return jsonify({'error': 'Token expired'}), 401
         except jwt.InvalidTokenError as e:
             return jsonify({'error': 'Token is invalid', 'details': str(e)}), 401
-        except Exception as e:
-            return jsonify({'error': 'Token decode error', 'details': str(e)}), 401
 
         return f(current_user, *args, **kwargs)
     return decorated
@@ -187,96 +187,53 @@ def admin_login():
 # -------------------------
 # Routes: Issues
 # -------------------------
-@app.route('/api/issues', methods=['GET'])
-def get_issues_public():
-    """ Public: anyone can view issues """
-    query = Issue.query
-    user_id = request.args.get('user_id')
-    status = request.args.get('status')
-    search = request.args.get('search')
-
-    if user_id:
-        query = query.filter_by(reported_by=int(user_id))
-    if status:
-        query = query.filter_by(status=status)
-    if search:
-        query = query.filter((Issue.title.contains(search)) | (Issue.description.contains(search)))
-
-    issues = query.order_by(Issue.created_at.desc()).all()
-    issues_data = []
-    for i in issues:
-        issues_data.append({
-            'id': i.id,
-            'title': i.title,
-            'description': i.description,
-            'issue_type': i.issue_type,
-            'status': i.status,
-            'priority': i.priority,
-            'latitude': i.latitude,
-            'longitude': i.longitude,
-            'address': i.address,
-            'image_url': i.image_url,
-            'reported_by': i.reported_by,
-            'created_at': i.created_at.isoformat(),
-            'updated_at': i.updated_at.isoformat() if i.updated_at else None
-        })
-    return jsonify({'issues': issues_data, 'total': len(issues_data)})
-
 @app.route('/api/issues', methods=['POST'])
 @token_required
 def create_issue(current_user):
-    # same as before (kept secure for logged-in users)
-    if request.content_type and 'multipart/form-data' in request.content_type:
-        title = request.form.get('title')
-        description = request.form.get('description')
-        issue_type = request.form.get('issue_type')
-        latitude = request.form.get('latitude')
-        longitude = request.form.get('longitude')
-        accuracy = request.form.get('accuracy')
-    else:
-        data = request.get_json() or {}
-        title = data.get('title')
-        description = data.get('description')
-        issue_type = data.get('issue_type')
-        latitude = data.get('latitude')
-        longitude = data.get('longitude')
-        accuracy = data.get('accuracy')
+    data = request.get_json() or {}
+    title = data.get('title')
+    issue_type = data.get('issue_type')
+    lat, lng = data.get('latitude'), data.get('longitude')
 
-    if not title or not issue_type or latitude is None or longitude is None:
-        return jsonify({'error': 'Missing required fields (title, issue_type, latitude, longitude)'}), 400
+    if not title or not issue_type or lat is None or lng is None:
+        return jsonify({'error': 'Title, issue_type, latitude, and longitude required'}), 400
 
-    image_url = None
-    if 'image' in request.files:
-        file = request.files['image']
-        if file and file.filename:
-            ext = file.filename.rsplit('.', 1)[-1].lower()
-            filename = f"{uuid.uuid4().hex}.{ext}"
-            safe_name = secure_filename(filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_name)
-            file.save(filepath)
-            image_url = f"/uploads/{safe_name}"
-
-    try:
-        lat = float(latitude)
-        lng = float(longitude)
-        address = get_address_from_coordinates(lat, lng)
-    except Exception:
-        address = None
-
+    address = get_address_from_coordinates(lat, lng)
     issue = Issue(
         title=title,
-        description=description,
+        description=data.get('description'),
         issue_type=issue_type,
-        latitude=float(latitude),
-        longitude=float(longitude),
-        accuracy=float(accuracy) if accuracy else None,
+        latitude=lat,
+        longitude=lng,
+        accuracy=data.get('accuracy'),
         address=address,
-        image_url=image_url,
+        image_url=data.get('image_url'),
         reported_by=current_user.id
     )
     db.session.add(issue)
     db.session.commit()
-    return jsonify({'message': 'Issue created', 'issue_id': issue.id}), 201
+    return jsonify({'message': 'Issue created successfully', 'id': issue.id}), 201
+
+@app.route('/api/issues', methods=['GET'])
+@token_required
+def list_issues(current_user):
+    issues = Issue.query.all()
+    return jsonify([{
+        'id': i.id,
+        'title': i.title,
+        'description': i.description,
+        'issue_type': i.issue_type,
+        'status': i.status,
+        'priority': i.priority,
+        'latitude': i.latitude,
+        'longitude': i.longitude,
+        'address': i.address,
+        'image_url': i.image_url,
+        'reported_by': i.reported_by,
+        'assigned_to': i.assigned_to,
+        'created_at': i.created_at.isoformat(),
+        'updated_at': i.updated_at.isoformat(),
+    } for i in issues])
 
 @app.route('/api/issues/<int:issue_id>', methods=['PUT'])
 @token_required
@@ -284,93 +241,62 @@ def update_issue(current_user, issue_id):
     issue = Issue.query.get_or_404(issue_id)
     data = request.get_json() or {}
 
-    if current_user.role != 'admin' and issue.reported_by != current_user.id:
-        return jsonify({'error': 'Unauthorized'}), 403
+    if 'status' in data:
+        issue.status = data['status']
+    if 'priority' in data:
+        issue.priority = data['priority']
+    if 'assigned_to' in data:
+        issue.assigned_to = data['assigned_to']
 
-    old_status = issue.status
-    new_status = data.get('status', issue.status)
-    issue.status = new_status
-    issue.priority = data.get('priority', issue.priority)
-
-    if new_status == 'resolved' and old_status != 'resolved':
-        issue.resolved_at = datetime.utcnow()
-
-    if current_user.role == 'admin' and 'assigned_to' in data:
-        issue.assigned_to = data.get('assigned_to')
-
-    if old_status != new_status:
-        update = IssueUpdate(issue_id=issue.id, user_id=current_user.id,
-                             update_text=data.get('update_text'), status_change=f"{old_status} -> {new_status}")
-        db.session.add(update)
-
+    issue.updated_at = datetime.utcnow()
     db.session.commit()
-    return jsonify({'message': 'Issue updated'})
+
+    update = IssueUpdate(
+        issue_id=issue.id,
+        user_id=current_user.id,
+        update_text=data.get('update_text'),
+        status_change=issue.status
+    )
+    db.session.add(update)
+    db.session.commit()
+
+    return jsonify({'message': 'Issue updated successfully'})
 
 @app.route('/api/issues/<int:issue_id>', methods=['DELETE'])
 @token_required
 def delete_issue(current_user, issue_id):
     issue = Issue.query.get_or_404(issue_id)
-    if current_user.role != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 403
-
-    if issue.image_url and issue.image_url.startswith('/uploads/'):
-        filename = issue.image_url.split('/')[-1]
-        try:
-            os.remove(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-        except Exception:
-            pass
-
-    IssueUpdate.query.filter_by(issue_id=issue.id).delete()
     db.session.delete(issue)
     db.session.commit()
-    return jsonify({'message': 'Issue deleted'})
+    return jsonify({'message': 'Issue deleted successfully'})
 
 # -------------------------
-# Admin stats (now PUBLIC)
+# Whisper STT Route
 # -------------------------
-@app.route('/api/admin/stats', methods=['GET'])
-def get_admin_stats_public():
-    total_issues = Issue.query.count()
-    pending_issues = Issue.query.filter(Issue.status.in_(['reported', 'acknowledged'])).count()
-    in_progress_issues = Issue.query.filter_by(status='in_progress').count()
-    resolved_issues = Issue.query.filter_by(status='resolved').count()
+@app.route('/api/transcribe', methods=['POST'])
+def transcribe_audio():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
 
-    week_ago = datetime.utcnow() - timedelta(days=7)
-    recent_issues = Issue.query.filter(Issue.created_at >= week_ago).count()
+    file = request.files['file']
+    if not file.filename:
+        return jsonify({'error': 'Empty filename'}), 400
 
-    issue_types = db.session.query(Issue.issue_type, func.count(Issue.id)).group_by(Issue.issue_type).all()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp:
+        file.save(temp.name)
+        audio_path = temp.name
 
-    return jsonify({
-        'total_issues': total_issues,
-        'pending_issues': pending_issues,
-        'in_progress_issues': in_progress_issues,
-        'resolved_issues': resolved_issues,
-        'recent_issues': recent_issues,
-        'issue_types': dict(issue_types),
-        'response_time_avg': 2.3
-    })
+    try:
+        model = whisper.load_model("base")  # try "small" or "tiny" for faster
+        result = model.transcribe(audio_path)
+        text = result.get("text", "").strip()
+    except Exception as e:
+        return jsonify({'error': 'Transcription failed', 'details': str(e)}), 500
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
 
-# -------------------------
-# Issue updates / uploads
-# -------------------------
-@app.route('/api/issues/<int:issue_id>/updates', methods=['GET'])
-def get_issue_updates_public(issue_id):
-    updates = IssueUpdate.query.filter_by(issue_id=issue_id).order_by(IssueUpdate.created_at.desc()).all()
-    updates_data = []
-    for u in updates:
-        user = User.query.get(u.user_id)
-        updates_data.append({
-            'id': u.id,
-            'update_text': u.update_text,
-            'status_change': u.status_change,
-            'created_at': u.created_at.isoformat(),
-            'user_name': user.name if user else 'Unknown'
-        })
-    return jsonify({'updates': updates_data})
-
-@app.route('/uploads/<path:filename>', methods=['GET'])
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    return jsonify({'text': text})
 
 # -------------------------
 # Initialization / main
@@ -381,3 +307,4 @@ with app.app_context():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+
